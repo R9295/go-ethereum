@@ -23,11 +23,15 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/internal/flags"
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/tests"
 	"github.com/urfave/cli/v2"
 )
@@ -44,6 +48,11 @@ var (
 		Category: flags.VMCategory,
 		Value:    -1, // default to select all subtest indices
 	}
+	sharedMemoryFlag = &cli.StringFlag{
+		Name:     "statetest.shared-memory",
+		Usage:    "Run as a long-lived server: poll <file>.signal for START/EXIT, read test from <file>, write state root or error back to <file>, then write OK/FAIL to <file>.signal.",
+		Category: flags.VMCategory,
+	}
 )
 var stateTestCommand = &cli.Command{
 	Action:    stateTestCmd,
@@ -57,10 +66,14 @@ var stateTestCommand = &cli.Command{
 		HumanReadableFlag,
 		idxFlag,
 		RunFlag,
+		sharedMemoryFlag,
 	}, traceFlags),
 }
 
 func stateTestCmd(ctx *cli.Context) error {
+	if shared := ctx.String(sharedMemoryFlag.Name); shared != "" {
+		return runSharedMemoryServer(ctx, shared)
+	}
 	path := ctx.Args().First()
 
 	// If path is provided, run the tests at that path.
@@ -158,4 +171,126 @@ func runStateTest(ctx *cli.Context, fname string) ([]testResult, error) {
 		}
 	}
 	return results, nil
+}
+
+// runSharedMemoryServer parks the binary in a poll loop coordinated with a
+// harness via two files: dataPath holds the test JSON (then the result), and
+// dataPath+".signal" holds one of START/OK/FAIL/EXIT. See the package-level
+// docs / cmd help for the exact wire protocol.
+func runSharedMemoryServer(ctx *cli.Context, dataPath string) error {
+	signalPath := dataPath + ".signal"
+
+	cfg := vm.Config{Tracer: tracerFromFlags(ctx)}
+	re, err := regexp.Compile(ctx.String(RunFlag.Name))
+	if err != nil {
+		return fmt.Errorf("invalid regex -%s: %v", RunFlag.Name, err)
+	}
+	forkFilter := ctx.String(forkFlag.Name)
+	idxFilter := ctx.Int(idxFlag.Name)
+
+	for {
+		signal := readSignal(signalPath)
+		switch signal {
+		case "EXIT":
+			return nil
+		case "START":
+			rootHex, logsHex, runErr := runStateTestForServer(dataPath, cfg, re, forkFilter, idxFilter)
+			if runErr != nil {
+				if werr := atomicWrite(dataPath, []byte(runErr.Error())); werr != nil {
+					return fmt.Errorf("failed to write error to %s: %w", dataPath, werr)
+				}
+				if werr := atomicWrite(signalPath, []byte("FAIL")); werr != nil {
+					return fmt.Errorf("failed to write signal: %w", werr)
+				}
+			} else {
+				if werr := atomicWrite(dataPath, []byte(rootHex+"\n"+logsHex+"\n")); werr != nil {
+					return fmt.Errorf("failed to write root to %s: %w", dataPath, werr)
+				}
+				if werr := atomicWrite(signalPath, []byte("OK")); werr != nil {
+					return fmt.Errorf("failed to write signal: %w", werr)
+				}
+			}
+		default:
+			time.Sleep(100 * time.Microsecond)
+		}
+	}
+}
+
+// readSignal returns the trimmed contents of the signal file, or "" if it
+// can't be read (treated as "no signal yet").
+func readSignal(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// atomicWrite writes data to a sibling .tmp file then renames over path. The
+// rename is atomic on POSIX filesystems.
+func atomicWrite(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// runStateTestForServer parses the test JSON at dataPath, runs every subtest
+// matching the supplied filters, and returns the single post-state root hex
+// and logs-hash hex. Errors if zero or multiple distinct (root, logs) pairs are produced.
+func runStateTestForServer(dataPath string, cfg vm.Config, re *regexp.Regexp, forkFilter string, idxFilter int) (string, string, error) {
+	src, err := os.ReadFile(dataPath)
+	if err != nil {
+		return "", "", err
+	}
+	var testsByName map[string]tests.StateTest
+	if err := json.Unmarshal(src, &testsByName); err != nil {
+		return "", "", fmt.Errorf("unable to parse test file %s: %w", dataPath, err)
+	}
+
+	var (
+		gotRoot common.Hash
+		gotLogs common.Hash
+		seen    bool
+	)
+	for key, test := range testsByName {
+		if !re.MatchString(key) {
+			continue
+		}
+		for i, st := range test.Subtests() {
+			if idxFilter != -1 && idxFilter != i {
+				continue
+			}
+			if forkFilter != "" && st.Fork != forkFilter {
+				continue
+			}
+			var (
+				subRoot  common.Hash
+				subLogs  common.Hash
+				captured bool
+			)
+			test.Run(st, cfg, false, rawdb.HashScheme, func(_ error, state *tests.StateTestState) {
+				if state.StateDB != nil {
+					subRoot = state.StateDB.IntermediateRoot(false)
+					encoded, _ := rlp.EncodeToBytes(state.StateDB.Logs())
+					subLogs = crypto.Keccak256Hash(encoded)
+					captured = true
+				}
+			})
+			if !captured {
+				return "", "", fmt.Errorf("subtest %s[%d] produced no state root", st.Fork, i)
+			}
+			if seen && (subRoot != gotRoot || subLogs != gotLogs) {
+				return "", "", fmt.Errorf("multiple subtests with differing roots — please filter input")
+			}
+			gotRoot = subRoot
+			gotLogs = subLogs
+			seen = true
+		}
+	}
+	if !seen {
+		return "", "", fmt.Errorf("no matching subtest")
+	}
+	return fmt.Sprintf("%#x", gotRoot), fmt.Sprintf("%#x", gotLogs), nil
 }
