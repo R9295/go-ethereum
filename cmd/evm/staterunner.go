@@ -18,6 +18,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -28,6 +29,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/internal/flags"
@@ -50,7 +52,7 @@ var (
 	}
 	sharedMemoryFlag = &cli.StringFlag{
 		Name:     "statetest.shared-memory",
-		Usage:    "Run as a long-lived server: poll <file>.signal for START/EXIT, read test from <file>, write state root or error back to <file>, then write OK/FAIL to <file>.signal.",
+		Usage:    "Run as a long-lived server: poll <file>.signal for START/EXIT, read test from <file>, write state root, logs hash, and unique stack witness values or error back to <file>, then write OK/FAIL to <file>.signal.",
 		Category: flags.VMCategory,
 	}
 )
@@ -194,7 +196,7 @@ func runSharedMemoryServer(ctx *cli.Context, dataPath string) error {
 		case "EXIT":
 			return nil
 		case "START":
-			rootHex, logsHex, runErr := runStateTestForServer(dataPath, cfg, re, forkFilter, idxFilter)
+			rootHex, logsHex, stackWitnessHex, runErr := runStateTestForServer(dataPath, cfg, re, forkFilter, idxFilter)
 			if runErr != nil {
 				if werr := atomicWrite(dataPath, []byte(runErr.Error())); werr != nil {
 					return fmt.Errorf("failed to write error to %s: %w", dataPath, werr)
@@ -203,7 +205,7 @@ func runSharedMemoryServer(ctx *cli.Context, dataPath string) error {
 					return fmt.Errorf("failed to write signal: %w", werr)
 				}
 			} else {
-				if werr := atomicWrite(dataPath, []byte(rootHex+"\n"+logsHex+"\n")); werr != nil {
+				if werr := atomicWrite(dataPath, []byte(rootHex+"\n"+logsHex+"\n"+stackWitnessHex+"\n")); werr != nil {
 					return fmt.Errorf("failed to write root to %s: %w", dataPath, werr)
 				}
 				if werr := atomicWrite(signalPath, []byte("OK")); werr != nil {
@@ -236,23 +238,68 @@ func atomicWrite(path string, data []byte) error {
 	return os.Rename(tmp, path)
 }
 
+type stackWitnessCollector struct {
+	seen map[string]struct{}
+}
+
+func newStackWitnessCollector() *stackWitnessCollector {
+	return &stackWitnessCollector{seen: make(map[string]struct{})}
+}
+
+func (c *stackWitnessCollector) hooks(inner *tracing.Hooks) *tracing.Hooks {
+	hooks := &tracing.Hooks{}
+	if inner != nil {
+		*hooks = *inner
+	}
+	prevOnOpcode := hooks.OnOpcode
+	hooks.OnOpcode = func(pc uint64, op byte, gas, cost uint64, scope tracing.OpContext, rData []byte, depth int, err error) {
+		if prevOnOpcode != nil {
+			prevOnOpcode(pc, op, gas, cost, scope, rData, depth, err)
+		}
+		c.onOpcode(scope)
+	}
+	return hooks
+}
+
+func (c *stackWitnessCollector) onOpcode(scope tracing.OpContext) {
+	for _, stackItem := range scope.StackData() {
+		word := stackItem.Bytes32()
+		c.seen["0x"+hex.EncodeToString(word[:])] = struct{}{}
+	}
+}
+
+func (c *stackWitnessCollector) encode() (string, error) {
+	values := make([]string, 0, len(c.seen))
+	for value := range c.seen {
+		values = append(values, value)
+	}
+	slices.Sort(values)
+	encoded, err := json.Marshal(values)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
+}
+
 // runStateTestForServer parses the test JSON at dataPath, runs every subtest
-// matching the supplied filters, and returns the single post-state root hex
-// and logs-hash hex. Errors if zero or multiple distinct (root, logs) pairs are produced.
-func runStateTestForServer(dataPath string, cfg vm.Config, re *regexp.Regexp, forkFilter string, idxFilter int) (string, string, error) {
+// matching the supplied filters, and returns the single post-state root hex,
+// logs-hash hex, and sorted JSON array of unique stack words observed by the
+// opcode tracer. Errors if zero or multiple distinct outputs are produced.
+func runStateTestForServer(dataPath string, cfg vm.Config, re *regexp.Regexp, forkFilter string, idxFilter int) (string, string, string, error) {
 	src, err := os.ReadFile(dataPath)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	var testsByName map[string]tests.StateTest
 	if err := json.Unmarshal(src, &testsByName); err != nil {
-		return "", "", fmt.Errorf("unable to parse test file %s: %w", dataPath, err)
+		return "", "", "", fmt.Errorf("unable to parse test file %s: %w", dataPath, err)
 	}
 
 	var (
-		gotRoot common.Hash
-		gotLogs common.Hash
-		seen    bool
+		gotRoot         common.Hash
+		gotLogs         common.Hash
+		gotStackWitness string
+		seen            bool
 	)
 	for key, test := range testsByName {
 		if !re.MatchString(key) {
@@ -266,11 +313,15 @@ func runStateTestForServer(dataPath string, cfg vm.Config, re *regexp.Regexp, fo
 				continue
 			}
 			var (
-				subRoot  common.Hash
-				subLogs  common.Hash
-				captured bool
+				subRoot         common.Hash
+				subLogs         common.Hash
+				subStackWitness string
+				captured        bool
 			)
-			test.Run(st, cfg, false, rawdb.HashScheme, func(_ error, state *tests.StateTestState) {
+			collector := newStackWitnessCollector()
+			serverCfg := cfg
+			serverCfg.Tracer = collector.hooks(serverCfg.Tracer)
+			test.Run(st, serverCfg, false, rawdb.HashScheme, func(_ error, state *tests.StateTestState) {
 				if state.StateDB != nil {
 					subRoot = state.StateDB.IntermediateRoot(false)
 					encoded, _ := rlp.EncodeToBytes(state.StateDB.Logs())
@@ -278,19 +329,24 @@ func runStateTestForServer(dataPath string, cfg vm.Config, re *regexp.Regexp, fo
 					captured = true
 				}
 			})
-			if !captured {
-				return "", "", fmt.Errorf("subtest %s[%d] produced no state root", st.Fork, i)
+			subStackWitness, err = collector.encode()
+			if err != nil {
+				return "", "", "", fmt.Errorf("failed to encode stack witness for subtest %s[%d]: %w", st.Fork, i, err)
 			}
-			if seen && (subRoot != gotRoot || subLogs != gotLogs) {
-				return "", "", fmt.Errorf("multiple subtests with differing roots — please filter input")
+			if !captured {
+				return "", "", "", fmt.Errorf("subtest %s[%d] produced no state root", st.Fork, i)
+			}
+			if seen && (subRoot != gotRoot || subLogs != gotLogs || subStackWitness != gotStackWitness) {
+				return "", "", "", fmt.Errorf("multiple subtests with differing outputs — please filter input")
 			}
 			gotRoot = subRoot
 			gotLogs = subLogs
+			gotStackWitness = subStackWitness
 			seen = true
 		}
 	}
 	if !seen {
-		return "", "", fmt.Errorf("no matching subtest")
+		return "", "", "", fmt.Errorf("no matching subtest")
 	}
-	return fmt.Sprintf("%#x", gotRoot), fmt.Sprintf("%#x", gotLogs), nil
+	return fmt.Sprintf("%#x", gotRoot), fmt.Sprintf("%#x", gotLogs), gotStackWitness, nil
 }
