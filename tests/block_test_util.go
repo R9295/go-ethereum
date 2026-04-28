@@ -51,6 +51,15 @@ type BlockTest struct {
 	json btJSON
 }
 
+// BlockImportStatus is the raw import outcome for a single block candidate in
+// a blockchain test fixture.
+type BlockImportStatus string
+
+const (
+	BlockImported BlockImportStatus = "IMPORTED"
+	BlockRejected BlockImportStatus = "REJECTED"
+)
+
 // UnmarshalJSON implements json.Unmarshaler interface.
 func (t *BlockTest) UnmarshalJSON(in []byte) error {
 	return json.Unmarshal(in, &t.json)
@@ -204,6 +213,70 @@ func (t *BlockTest) Run(snapshotter bool, scheme string, witness bool, tracer *t
 		}
 	}
 	return t.validateImportedHeaders(chain, validBlocks)
+}
+
+// StatusSequence returns the actual IMPORTED/REJECTED outcome for every block
+// candidate in fixture order. Unlike Run, this does not validate the final
+// chain head or post-state; it only reports raw block import results.
+func (t *BlockTest) StatusSequence(snapshotter bool, scheme string, witness bool, tracer *tracing.Hooks) ([]BlockImportStatus, error) {
+	config, ok := Forks[t.json.Network]
+	if !ok {
+		return nil, UnsupportedForkError{t.json.Network}
+	}
+
+	var (
+		gspec = t.genesis(config)
+		db    = rawdb.NewMemoryDatabase()
+		tconf = &triedb.Config{
+			Preimages: true,
+			IsUBT:     gspec.Config.UBTTime != nil && *gspec.Config.UBTTime <= gspec.Timestamp,
+		}
+	)
+	if scheme == rawdb.PathScheme || tconf.IsUBT {
+		tconf.PathDB = pathdb.Defaults
+	} else {
+		tconf.HashDB = hashdb.Defaults
+	}
+
+	if gspec.Config.TerminalTotalDifficulty == nil {
+		gspec.Config.TerminalTotalDifficulty = big.NewInt(stdmath.MaxInt64)
+	}
+	triedb := triedb.NewDatabase(db, tconf)
+	gblock, err := gspec.Commit(db, triedb, nil)
+	if err != nil {
+		return nil, err
+	}
+	triedb.Close()
+
+	if gblock.Hash() != t.json.Genesis.Hash {
+		return nil, fmt.Errorf("genesis block hash doesn't match test: computed=%x, test=%x", gblock.Hash().Bytes()[:6], t.json.Genesis.Hash[:6])
+	}
+	if gblock.Root() != t.json.Genesis.StateRoot {
+		return nil, fmt.Errorf("genesis block state root does not match test: computed=%x, test=%x", gblock.Root().Bytes()[:6], t.json.Genesis.StateRoot[:6])
+	}
+
+	engine := beacon.New(ethash.NewFaker())
+	options := &core.BlockChainConfig{
+		TrieCleanLimit: 0,
+		StateScheme:    scheme,
+		Preimages:      true,
+		TxLookupLimit:  -1,
+		VmConfig: vm.Config{
+			Tracer: tracer,
+		},
+		StatelessSelfValidation: witness,
+	}
+	if snapshotter {
+		options.SnapshotLimit = 1
+		options.SnapshotWait = true
+	}
+	chain, err := core.NewBlockChain(db, gspec, engine, options)
+	if err != nil {
+		return nil, err
+	}
+	defer chain.Stop()
+
+	return t.collectStatusSequence(chain), nil
 }
 
 // Network returns the network/fork name for this test.
@@ -394,6 +467,23 @@ func (t *BlockTest) validateImportedHeaders(cm *core.BlockChain, validBlocks []b
 		}
 	}
 	return nil
+}
+
+func (t *BlockTest) collectStatusSequence(blockchain *core.BlockChain) []BlockImportStatus {
+	statuses := make([]BlockImportStatus, 0, len(t.json.Blocks))
+	for _, b := range t.json.Blocks {
+		cb, err := b.decode()
+		if err != nil {
+			statuses = append(statuses, BlockRejected)
+			continue
+		}
+		if _, err := blockchain.InsertChain(types.Blocks{cb}); err != nil {
+			statuses = append(statuses, BlockRejected)
+			continue
+		}
+		statuses = append(statuses, BlockImported)
+	}
+	return statuses
 }
 
 func (bb *btBlock) decode() (*types.Block, error) {

@@ -24,14 +24,23 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/internal/flags"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/tests"
 	"github.com/urfave/cli/v2"
 )
+
+var blockSharedMemoryFlag = &cli.StringFlag{
+	Name:     "blocktest.shared-memory",
+	Usage:    "Run as a long-lived server: poll <file>.signal for START/EXIT, read block test from <file>, write one IMPORTED/REJECTED line per block or error back to <file>, then write OK/FAIL to <file>.signal.",
+	Category: flags.VMCategory,
+}
 
 var blockTestCommand = &cli.Command{
 	Action:    blockTestCmd,
@@ -44,10 +53,14 @@ var blockTestCommand = &cli.Command{
 		RunFlag,
 		WitnessCrossCheckFlag,
 		FuzzFlag,
+		blockSharedMemoryFlag,
 	}, traceFlags),
 }
 
 func blockTestCmd(ctx *cli.Context) error {
+	if shared := ctx.String(blockSharedMemoryFlag.Name); shared != "" {
+		return runBlockSharedMemoryServer(ctx, shared)
+	}
 	path := ctx.Args().First()
 
 	// If path is provided, run the tests at that path.
@@ -83,6 +96,95 @@ func blockTestCmd(ctx *cli.Context) error {
 		}
 	}
 	return nil
+}
+
+func runBlockSharedMemoryServer(ctx *cli.Context, dataPath string) error {
+	signalPath := dataPath + ".signal"
+	re, err := regexp.Compile(ctx.String(RunFlag.Name))
+	if err != nil {
+		return fmt.Errorf("invalid regex -%s: %v", RunFlag.Name, err)
+	}
+
+	for {
+		switch readSignal(signalPath) {
+		case "EXIT":
+			return nil
+		case "START":
+			statuses, runErr := runBlockTestForServer(ctx, dataPath, re)
+			if runErr != nil {
+				if werr := atomicWrite(dataPath, []byte(runErr.Error())); werr != nil {
+					return fmt.Errorf("failed to write error to %s: %w", dataPath, werr)
+				}
+				if werr := atomicWrite(signalPath, []byte("FAIL")); werr != nil {
+					return fmt.Errorf("failed to write signal: %w", werr)
+				}
+			} else {
+				payload := serializeBlockStatuses(statuses)
+				if werr := atomicWrite(dataPath, []byte(payload)); werr != nil {
+					return fmt.Errorf("failed to write statuses to %s: %w", dataPath, werr)
+				}
+				if werr := atomicWrite(signalPath, []byte("OK")); werr != nil {
+					return fmt.Errorf("failed to write signal: %w", werr)
+				}
+			}
+		default:
+			time.Sleep(100 * time.Microsecond)
+		}
+	}
+}
+
+func runBlockTestForServer(ctx *cli.Context, fname string, re *regexp.Regexp) ([]tests.BlockImportStatus, error) {
+	src, err := os.ReadFile(fname)
+	if err != nil {
+		return nil, err
+	}
+	var testsByName map[string]*tests.BlockTest
+	if err := json.Unmarshal(src, &testsByName); err != nil {
+		return nil, fmt.Errorf("unable to parse test file %s: %w", fname, err)
+	}
+
+	if ctx.IsSet(FuzzFlag.Name) {
+		log.SetDefault(log.NewLogger(log.DiscardHandler()))
+	}
+
+	var (
+		agreed []tests.BlockImportStatus
+		seen   bool
+	)
+	matched := 0
+	for _, name := range slices.Sorted(maps.Keys(testsByName)) {
+		if !re.MatchString(name) {
+			continue
+		}
+		statuses, err := testsByName[name].StatusSequence(
+			false,
+			rawdb.PathScheme,
+			ctx.Bool(WitnessCrossCheckFlag.Name),
+			tracerFromFlags(ctx),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("unable to run block test %s: %w", name, err)
+		}
+		if !seen {
+			agreed = statuses
+			seen = true
+		} else if !slices.Equal(agreed, statuses) {
+			return nil, fmt.Errorf("multiple block tests with differing outputs -- please filter input")
+		}
+		matched++
+	}
+	if matched == 0 {
+		return nil, fmt.Errorf("no matching block test")
+	}
+	return agreed, nil
+}
+
+func serializeBlockStatuses(statuses []tests.BlockImportStatus) string {
+	lines := make([]string, len(statuses))
+	for i, status := range statuses {
+		lines[i] = string(status)
+	}
+	return strings.Join(lines, "\n") + "\n"
 }
 
 func runBlockTest(ctx *cli.Context, fname string) ([]testResult, error) {
